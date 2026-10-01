@@ -1,6 +1,12 @@
 // Emacs style mode select   -*- C -*-
 
 //=======================
+// Author: Mushfiqur Rahman Nafees.
+// 
+// credit goes to:
+// Tsoding: https://github.com/tsoding/boomer
+// CoffeeIsPower: https://github.com/coffeeispower/woomer
+//
 // Design notes for this port:
 //   - Screenshot capture is delegated to `grim`, the standard wlroots
 //     screencopy CLI tool, invoked via popen() and piped straight into
