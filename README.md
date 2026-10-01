@@ -2,7 +2,7 @@
 
 A lightweight, high-performance zoom and spotlight utility for Wayland compositors (for Sway now), written in C using **raylib** and GLSL shaders.
 
-It is inspired by the original Rust version of `woomer`, designed to capture screen output seamlessly and provide smooth zoom, flash, and spotlight effects.
+It is inspired by the original Rust version of `woomer`, and Tsoding's boomer for (X11) designed to capture screen output seamlessly and provide smooth zoom, flash, and spotlight effects.
 
 ## Features
 
@@ -46,8 +46,8 @@ Clone the repository and compile using either `make` or the build script:
 
 ```
 # Clone the repository
-git clone https://github.com/YOUR-USERNAME/woomer.git
-cd woomer
+git clone https://github.com/mushfiqurrahman1729/woomer-c.git
+cd woomer-c
 
 # Build using Makefile
 make
