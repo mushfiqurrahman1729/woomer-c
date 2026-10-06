@@ -41,6 +41,28 @@
 #define SPOTLIGHT_TINT ((Color){0x00, 0x00, 0x00, 190})
 #define VELOCITY_THRESHOLD 15.0f
 
+// ---- Feel of zoom / flashlight (all rates are per second) ----------------
+#define MAX_DT              0.05f  // clamp frame time so a hitch can't cause a jump
+#define ZOOM_MIN            0.01f
+#define ZOOM_MAX            100000.0f
+#define ZOOM_DECAY          4.0    // how fast zoom momentum fades
+#define ZOOM_LOG_GAIN       0.8    // one wheel tick ~= 0.8/4 = 0.2 in log-zoom (x1.22)
+#define ZOOM_TICK           1.0    // impulse of one wheel tick / key press
+#define ZOOM_KEY_RATE       4.0    // extra impulse per second while "=" / "-" is held
+
+#define RADIUS_MIN          0.3f
+#define RADIUS_MAX          10.0f
+#define RADIUS_TICK_LOG     0.15f  // one wheel tick / key press = x1.16 radius
+#define RADIUS_KEY_RATE     1.2f   // log-radius per second while "+" / "_" is held
+#define RADIUS_SMOOTH       14.0f  // how fast the shown radius chases the target
+#define BURST_DECAY         5.0f   // how fast the Ctrl burst fades
+
+static inline float
+clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
 //--------
 // Output (monitor) description, as read from `swaymsg -t get_outputs -r`
 //-------
@@ -240,6 +262,14 @@ static void split_json_objects
     const char **e = malloc(sizeof(char *) * cap);
     int n = 0;
 
+    if (!s || !e)
+    {
+        free(s); free(e);
+        *starts = *ends = NULL;
+        *count = 0;
+        return;
+    }
+
     int depth = 0;
     const char *obj_start = NULL;
     for (size_t i = 0; i < len; i++)
@@ -258,8 +288,17 @@ static void split_json_objects
                 if (n == cap)
 		{
                     cap *= 2;
-                    s = realloc(s, sizeof(char *) * cap);
-                    e = realloc(e, sizeof(char *) * cap);
+                    const char **ns = realloc(s, sizeof(char *) * cap);
+                    if (ns) s = ns;
+                    const char **ne = realloc(e, sizeof(char *) * cap);
+                    if (ne) e = ne;
+                    if (!ns || !ne)
+                    {
+                        free(s); free(e);
+                        *starts = *ends = NULL;
+                        *count = 0;
+                        return;
+                    }
                 }
                 s[n] = obj_start;
                 e[n] = &json[i] + 1;
@@ -304,6 +343,12 @@ static bool parse_sway_outputs
     }
 
     Output *items = calloc((size_t)count, sizeof(Output));
+    if (!items)
+    {
+        free(starts);
+        free(ends);
+        return false;
+    }
     int n = 0;
 
     for (int i = 0; i < count; i++)
@@ -318,6 +363,8 @@ static bool parse_sway_outputs
         bool active = true;
         json_get_bool_field(os, oe, "active", &active);
         o.active = active;
+        if (!active)
+            continue; // disabled outputs have nothing to capture
 
         // Find the "rect" sub-object and read x/y/width/height from within it.
         const char *rect_hit = find_key(os, oe, "rect");
@@ -500,7 +547,16 @@ print_help_and_exit(const char *bin)
         "    --monitor <name>     Monitor that the window will be shown on. Defaults to primary if not specified\n"
         "    --output <name>      Monitor that should be captured. Captures all monitors if not specified\n"
         "    --radius <number>    Size of the vignette radius. Bigger number means bigger radius. Defaults to 1\n"
-        "    -S --show-cursor     Whether to show cursor. Defaults to false, specify to enable\n",
+        "    -S --show-cursor     Whether to show cursor. Defaults to false, specify to enable\n"
+        "\n"
+        "KEYS:\n"
+        "    wheel, = -           Zoom in / out around the cursor\n"
+        "    Shift+wheel, + _     Resize the flashlight (flashlight must be on)\n"
+        "    F                    Toggle flashlight\n"
+        "    Ctrl                 Momentary flashlight burst\n"
+        "    0                    Reset view\n"
+        "    M                    Mirror\n"
+        "    Q, A, Esc, RMB       Quit\n",
         bin, bin);
     exit(0);
 }
@@ -545,6 +601,11 @@ parse_args(int argc, char **argv)
 		fprintf(stderr, "--radius must be a valid number (e.g., 5 or 3.5)\n");
 		exit(1);
 	    }
+            if (!(r > 0.0f))
+            {
+                fprintf(stderr, "--radius must be greater than 0\n");
+                exit(1);
+            }
             args.radius_multiplier = r;
         }
 	else if (strcmp(argv[i], "--show-cursor") == 0 || strcmp(argv[i], "-S") == 0)
@@ -580,16 +641,16 @@ main(int argc, char **argv)
     {
         bool found = false;
         for (int i = 0; i < outputs.count; i++)
-	{
+        {
             if (strcmp(outputs.items[i].name, args.monitor_name) == 0)
-	    {
+            {
                 display_idx = i;
                 found = true;
                 break;
             }
         }
         if (!found)
-	{
+        {
             fprintf(stderr, "Monitor '%s' not found.\n", args.monitor_name);
             return 1;
         }
@@ -602,33 +663,67 @@ main(int argc, char **argv)
     {
         bool found = false;
         for (int i = 0; i < outputs.count; i++)
-	{
+        {
             if (strcmp(outputs.items[i].name, args.output_name) == 0)
-	    {
+            {
                 selected_output = &outputs.items[i];
                 found = true;
                 break;
             }
         }
         if (!found)
-	{
+        {
             fprintf(stderr, "Output '%s' not found.\n", args.output_name);
             return 1;
         }
+    }
+
+    // ---------------------------------------------------------------
+    // World space: the screenshot is drawn into a rectangle of
+    // (world_w x world_h) *logical* pixels whose top-left is (0,0).
+    //   - one output captured: the rect is that output, nothing to offset.
+    //   - everything captured: grim returns the bounding box of all
+    //     outputs, so the monitor we show on starts at (display - min).
+    // `home` is the camera target that frames the display monitor.
+    // ---------------------------------------------------------------
+    float world_w, world_h;
+    Vector2 home;
+    if (selected_output)
+    {
+        world_w = (float)selected_output->width;
+        world_h = (float)selected_output->height;
+        home = (Vector2){ 0.0f, 0.0f };
+    }
+    else
+    {
+        int min_x = outputs.items[0].x, min_y = outputs.items[0].y;
+        int max_x = min_x + outputs.items[0].width;
+        int max_y = min_y + outputs.items[0].height;
+        for (int i = 1; i < outputs.count; i++)
+        {
+            Output *o = &outputs.items[i];
+            if (o->x < min_x) min_x = o->x;
+            if (o->y < min_y) min_y = o->y;
+            if (o->x + o->width  > max_x) max_x = o->x + o->width;
+            if (o->y + o->height > max_y) max_y = o->y + o->height;
+        }
+        world_w = (float)(max_x - min_x);
+        world_h = (float)(max_y - min_y);
+        home = (Vector2){ (float)(display_output->x - min_x),
+                          (float)(display_output->y - min_y) };
     }
 
     // Take the screenshot BEFORE opening our own window, so our
     // undecorated fullscreen window doesn't end up in its own capture.
     Image screenshot_image;
     if (!capture_screenshot
-	(selected_output ? selected_output->name : NULL,
+        (selected_output ? selected_output->name : NULL,
          args.show_cursor, &screenshot_image))
-	
     {
         fprintf(stderr, "Failed to take a screenshot (is `grim` installed?).\n");
         return 1;
     }
-    
+
 //>>>>>>>>
     // raylib window setup //
 //>>>>>>>>
@@ -644,12 +739,18 @@ main(int argc, char **argv)
     // and verify placement; SetWindowMonitor is still called defensively.
     int rl_monitor_count = GetMonitorCount();
     int rl_monitor_idx = display_idx < rl_monitor_count ? display_idx : 0;
-    
+
     SetWindowMonitor(rl_monitor_idx);
     ToggleFullscreen();
 
     Texture2D screenshot_texture = LoadTextureFromImage(screenshot_image);
     UnloadImage(screenshot_image);
+
+    // raylib defaults to nearest-neighbour sampling, which looks blocky and
+    // shimmers during a continuous zoom. Mipmaps + trilinear keep both
+    // zooming in and zooming far out smooth.
+    GenTextureMipmaps(&screenshot_texture);
+    SetTextureFilter(screenshot_texture, TEXTURE_FILTER_TRILINEAR);
 
     // Try to load the shader from the usual relative location first
     // (next to the executable, as installed), falling back to a compiled-in
@@ -665,16 +766,16 @@ main(int argc, char **argv)
         };
         bool loaded = false;
         for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
-	{
+        {
             if (FileExists(candidates[i]))
-	    {
+            {
                 spotlight_shader = LoadShader(NULL, candidates[i]);
                 loaded = true;
                 break;
             }
         }
         if (!loaded)
-	{
+        {
             static const char *fallback_fs =
                 "#version 330\n"
                 "in vec2 fragTexCoord;\n"
@@ -690,11 +791,9 @@ main(int argc, char **argv)
                 "    vec4 texelColor = texture(texture0, fragTexCoord);\n"
                 "    float distanceToCursor = distance(gl_FragCoord.xy, vec2(cursorPosition.x, cursorPosition.y));\n"
                 "    float spotlightRadius = float(UNIT_RADIUS) * spotlightRadiusMultiplier;\n"
-                "    if (distanceToCursor > spotlightRadius) {\n"
-                "        finalColor = (mix(texelColor, vec4(spotlightTint.rgb, 1.0), spotlightTint.a) * colDiffuse);\n"
-                "    } else {\n"
-                "        finalColor = (texelColor * colDiffuse);\n"
-                "    }\n"
+                "    float outside = smoothstep(spotlightRadius - 0.75, spotlightRadius + 0.75, distanceToCursor);\n"
+                "    vec4 dimmed = mix(texelColor, vec4(spotlightTint.rgb, 1.0), spotlightTint.a);\n"
+                "    finalColor = mix(texelColor, dimmed, outside) * colDiffuse;\n"
                 "}\n";
             spotlight_shader = LoadShaderFromMemory(NULL, fallback_fs);
         }
@@ -706,15 +805,28 @@ main(int argc, char **argv)
 
     Camera2D camera = {0};
     camera.zoom = 1.0f;
-    camera.target = (Vector2){ (float)display_output->x, (float)display_output->y };
+    camera.target = home;
     camera.offset = (Vector2){ 0, 0 };
     camera.rotation = 0.0f;
 
-    double delta_scale = 0.0;
-    Vector2 scale_pivot = GetMousePosition();
+    // --- zoom state: an impulse that decays; the zoom itself changes
+    //     multiplicatively so every step feels the same at any zoom level.
+    double zoom_impulse = 0.0;
+    Vector2 zoom_pivot = GetMousePosition();
+
+    // --- flashlight radius state: `target` is what the user asked for,
+    //     `shown` chases it exponentially (in log space) every frame, which
+    //     is what makes resizing look continuous instead of stepped.
+    //     `burst_log` is the temporary Ctrl boost (log of the extra factor).
+    float radius_target = clampf(args.radius_multiplier, RADIUS_MIN, RADIUS_MAX);
+    float radius_shown = radius_target;
+    float radius_burst_log = 0.0f;
+
+    // Latched when "=" / "-" goes down, so letting go of Shift a moment
+    // before the key doesn't flip a radius resize into a zoom mid-press.
+    bool key_radius_mode = false;
+
     Vector2 velocity = { 0, 0 };
-    float spotlight_radius_multiplier = 1.0f;
-    double spotlight_radius_multiplier_delta = 0.0;
     bool mirror = false;
     bool enable_spotlight = false;
     bool should_exit = false;
@@ -723,125 +835,187 @@ main(int argc, char **argv)
 
     while (!WindowShouldClose() && !should_exit)
     {
-        float dt = GetFrameTime();
+        float raw_dt = GetFrameTime();
+        float dt = raw_dt > MAX_DT ? MAX_DT : raw_dt;
 
         // Q or A to quit (covers AZERTY/QWERTY layouts, matching upstream)
         if (IsKeyPressed(KEY_Q) || IsKeyPressed(KEY_A))
-	{
+        {
             should_exit = true;
         }
-        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        {
             break;
         }
 
-        // Ctrl: momentary "flashlight burst" — jump the radius up, then let it
-        // decay back down over time via spotlight_radius_multiplier_delta.
+        // Ctrl: momentary "flashlight burst" - the radius jumps to 3x its
+        // current size, then eases back down on its own.
         if (IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL))
-	{
-            spotlight_radius_multiplier = args.radius_multiplier * 3.0f;
-            spotlight_radius_multiplier_delta = -15.0;
+        {
+            radius_burst_log = logf(3.0f);
         }
         if (IsKeyPressed(KEY_F))
-	{
+        {
             enable_spotlight = !enable_spotlight;
         }
 
+        Vector2 mouse_pos = GetMousePosition();
+        bool shift_down = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+
+        // ---------------- mouse wheel ----------------
         float scrolled_amount = GetMouseWheelMoveV().y;
         if (scrolled_amount != 0.0f)
-	{
-            bool shift_down = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        {
             if (!shift_down)
-	    {
-                delta_scale += (double)scrolled_amount;
+            {
+                // Plain scroll: zoom around the cursor.
+                zoom_impulse += (double)scrolled_amount * ZOOM_TICK;
+                zoom_pivot = mouse_pos;
             }
-	    else if (enable_spotlight && shift_down)
-	    {
-                // Shift+Scroll: directly resize the flashlight radius, proportional
-                // to its current size so each tick feels like a consistent zoom step
-                // whether the circle is tiny or huge. This is a direct, persistent
-                // change (not a decaying impulse like zoom/the Ctrl burst above),
-                // so the new size sticks until you scroll again.
-                float step = 1.0f + 0.15f * scrolled_amount;
-                spotlight_radius_multiplier =
-		    (float)fmin(fmax(
-                    (double)(spotlight_radius_multiplier * step), 0.3), 10.0);
-                // Cancel any in-flight Ctrl-burst decay so it doesn't immediately
-                // undo the resize you just asked for.
-                spotlight_radius_multiplier_delta = 0.0;
+            else if (enable_spotlight)
+            {
+                // Shift+Scroll: set a new target radius; the shown radius
+                // glides there (see smoothing below).
+                radius_target = clampf(radius_target * expf(RADIUS_TICK_LOG * scrolled_amount),
+                                       RADIUS_MIN, RADIUS_MAX);
             }
-            scale_pivot = GetMousePosition();
         }
 
-        if (fabs(delta_scale) > 0.5)
-	{
-            Vector2 p0 = { scale_pivot.x / camera.zoom, scale_pivot.y / camera.zoom };
-            camera.zoom = (float)fmin(fmax((double)camera.zoom + delta_scale * (double)dt, 0.01), 100000.0);
-            Vector2 p1 = { scale_pivot.x / camera.zoom, scale_pivot.y / camera.zoom };
+        // ---------------- keyboard ----------------
+        //   "=" / "-"       zoom in / out        (same as wheel)
+        //   "+" / "_"       flashlight bigger / smaller
+        //                   (= Shift+"=" / Shift+"-" on a US layout;
+        //                    same as Shift+wheel)
+        // A press gives one wheel-tick worth of change, holding the key
+        // keeps going at a steady rate.
+        int key_kick = (IsKeyPressed(KEY_EQUAL) ? 1 : 0) - (IsKeyPressed(KEY_MINUS) ? 1 : 0);
+        int key_hold = (IsKeyDown(KEY_EQUAL) ? 1 : 0) - (IsKeyDown(KEY_MINUS) ? 1 : 0);
+        if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_MINUS))
+        {
+            key_radius_mode = shift_down;
+        }
+        if (key_kick != 0 || key_hold != 0)
+        {
+            if (!key_radius_mode)
+            {
+                zoom_impulse += (double)key_kick * ZOOM_TICK
+                              + (double)key_hold * ZOOM_KEY_RATE * (double)dt;
+                zoom_pivot = mouse_pos;
+            }
+            else if (enable_spotlight)
+            {
+                float l = (float)key_kick * RADIUS_TICK_LOG
+                        + (float)key_hold * RADIUS_KEY_RATE * dt;
+                radius_target = clampf(radius_target * expf(l), RADIUS_MIN, RADIUS_MAX);
+            }
+        }
+
+        // ---------------- zoom integration ----------------
+        // Exact integral of an exponentially decaying impulse over this
+        // frame, so the result doesn't depend on the frame rate.
+        if (zoom_impulse != 0.0)
+        {
+            double k = 1.0 - exp(-ZOOM_DECAY * (double)dt);
+            double dlog = zoom_impulse * (k / ZOOM_DECAY) * ZOOM_LOG_GAIN;
+
+            Vector2 p0 = { zoom_pivot.x / camera.zoom, zoom_pivot.y / camera.zoom };
+            float new_zoom = (float)((double)camera.zoom * exp(dlog));
+            if (new_zoom <= ZOOM_MIN || new_zoom >= ZOOM_MAX)
+            {
+                new_zoom = clampf(new_zoom, ZOOM_MIN, ZOOM_MAX);
+                zoom_impulse = 0.0; // hit a limit: don't keep pushing
+            }
+            camera.zoom = new_zoom;
+            Vector2 p1 = { zoom_pivot.x / camera.zoom, zoom_pivot.y / camera.zoom };
             camera.target.x += p0.x - p1.x;
             camera.target.y += p0.y - p1.y;
-            delta_scale -= delta_scale * (double)dt * 4.0;
+
+            zoom_impulse *= (1.0 - k);
+            if (fabs(zoom_impulse) < 1e-3)
+                zoom_impulse = 0.0;
         }
 
-        // Apply any pending decay (currently only set by the Ctrl burst above).
-        if (spotlight_radius_multiplier_delta != 0.0)
-	{
-            spotlight_radius_multiplier = (float)fmin(fmax(
-                (double)spotlight_radius_multiplier + spotlight_radius_multiplier_delta * (double)dt,
-                0.3), 10.0);
-            spotlight_radius_multiplier_delta -= spotlight_radius_multiplier_delta * (double)dt * 8.0;
+        // ---------------- flashlight radius smoothing ----------------
+        {
+            float a = 1.0f - expf(-RADIUS_SMOOTH * dt);
+            radius_shown *= powf(radius_target / radius_shown, a);
+
+            radius_burst_log *= expf(-BURST_DECAY * dt);
+            if (radius_burst_log < 1e-3f)
+                radius_burst_log = 0.0f;
         }
 
-        Vector2 mouse_pos = GetMousePosition();
-        Vector2 mouse_delta = { mouse_pos.x - prev_mouse_pos.x, mouse_pos.y - prev_mouse_pos.y };
+        // ---------------- panning + inertia ----------------
+        Vector2 prev_screen_pos = prev_mouse_pos;
         prev_mouse_pos = mouse_pos;
 
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-	{
-            Vector2 prev_screen_pos = { mouse_pos.x - mouse_delta.x, mouse_pos.y - mouse_delta.y };
+        {
             Vector2 world_prev = GetScreenToWorld2D(prev_screen_pos, camera);
             Vector2 world_now = GetScreenToWorld2D(mouse_pos, camera);
             Vector2 delta = { world_prev.x - world_now.x, world_prev.y - world_now.y };
             camera.target.x += delta.x;
             camera.target.y += delta.y;
-            float fps = (float)GetFPS();
-            velocity.x = delta.x * fps;
-            velocity.y = delta.y * fps;
+            if (raw_dt > 0.0f)
+            {
+                velocity.x = delta.x / raw_dt;
+                velocity.y = delta.y / raw_dt;
+            }
         }
-	else if (
-	    (velocity.x * velocity.x + velocity.y * velocity.y) > VELOCITY_THRESHOLD * VELOCITY_THRESHOLD)
-	{
+        else if ((velocity.x * velocity.x + velocity.y * velocity.y) > VELOCITY_THRESHOLD * VELOCITY_THRESHOLD)
+        {
             camera.target.x += velocity.x * dt;
             camera.target.y += velocity.y * dt;
             float damp = fminf(fmaxf(camera.zoom, 0.6f), 10.0f);
-            velocity.x -= velocity.x * dt * 6.0f * damp;
-            velocity.y -= velocity.y * dt * 6.0f * damp;
+            float keep = expf(-6.0f * damp * dt); // exact decay, can't overshoot past 0
+            velocity.x *= keep;
+            velocity.y *= keep;
+        }
+        else
+        {
+            velocity.x = velocity.y = 0.0f;
         }
 
         if (IsKeyPressed(KEY_ZERO))
-	{
+        {
             camera.zoom = 1.0f;
-            camera.target = (Vector2)
-		{
-                selected_output ? (float)selected_output->x : 0.0f,
-                selected_output ? (float)selected_output->y : 0.0f
-                };
+            camera.target = home;
+            zoom_impulse = 0.0;
+            velocity = (Vector2){ 0, 0 };
             mirror = false;
         }
 
         if (IsKeyPressed(KEY_M))
-	{
+        {
             mirror = !mirror;
         }
+
+        // ---------------- draw ----------------
+        // The screenshot always fills the (world_w x world_h) world rect,
+        // whatever its pixel size (HiDPI grim captures are larger than the
+        // logical size). Mirror flips it around the display monitor's
+        // vertical centre line.
+        float mirror_axis = home.x + (float)display_output->width * 0.5f;
+        Rectangle src =
+        {
+            0, 0,
+            mirror ? -(float)screenshot_texture.width : (float)screenshot_texture.width,
+            (float)screenshot_texture.height
+        };
+        Rectangle dst =
+        {
+            mirror ? 2.0f * mirror_axis - world_w : 0.0f,
+            0.0f, world_w, world_h
+        };
 
         BeginDrawing();
         BeginMode2D(camera);
 
         if (enable_spotlight)
-	{
+        {
             ClearBackground(SPOTLIGHT_TINT);
-            Vector2 mouse_world_screen = GetMousePosition(); // spotlight uses raw screen-space cursor (matches gl_FragCoord)
             float tint_normalized[4] =
-	    {
+            {
                 SPOTLIGHT_TINT.r / 255.0f,
                 SPOTLIGHT_TINT.g / 255.0f,
                 SPOTLIGHT_TINT.b / 255.0f,
@@ -849,24 +1023,21 @@ main(int argc, char **argv)
             };
             SetShaderValue(spotlight_shader, spotlight_tint_loc, tint_normalized, SHADER_UNIFORM_VEC4);
 
+            // spotlight uses raw screen-space cursor (matches gl_FragCoord)
             float screen_height = (float)GetScreenHeight();
-            float cursor_pos[2] = { mouse_world_screen.x, screen_height - mouse_world_screen.y };
+            float cursor_pos[2] = { mouse_pos.x, screen_height - mouse_pos.y };
             SetShaderValue(spotlight_shader, cursor_position_loc, cursor_pos, SHADER_UNIFORM_VEC2);
 
-            float radius_val = spotlight_radius_multiplier * camera.zoom;
+            float radius_val = radius_shown * expf(radius_burst_log) * camera.zoom;
             SetShaderValue(spotlight_shader, spotlight_radius_multiplier_loc, &radius_val, SHADER_UNIFORM_FLOAT);
 
             BeginShaderMode(spotlight_shader);
-            DrawTexture(screenshot_texture, 0, 0, WHITE);
+            DrawTexturePro(screenshot_texture, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
             EndShaderMode();
         }
-	else
-	{
+        else
+        {
             ClearBackground(BLANK);
-            float scr_w = (float)GetScreenWidth();
-            float scr_h = (float)GetScreenHeight();
-            Rectangle src = { 0, 0, mirror ? -scr_w : scr_w, scr_h };
-            Rectangle dst = { 0, 0, scr_w, scr_h };
             DrawTexturePro(screenshot_texture, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
         }
 
