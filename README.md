@@ -1,88 +1,118 @@
 # Woomer (C Port)
 
-A lightweight, high-performance zoom and spotlight utility for Wayland compositors (for Sway now), written in C using **raylib** and GLSL shaders.
+A lightweight screen zoom and flashlight tool for Wayland, written in C with **raylib** and a small GLSL shader. It currently supports **Sway** (and other wlroots compositors that provide `grim` and `swaymsg`).
 
-It is inspired by the original Rust version of `woomer`, and Tsoding's `boomer` (for X11) designed to capture screen output seamlessly and provide smooth zoom, flash, and spotlight effects. 
+It is a port of the Rust [`woomer`](https://github.com/coffeeispower/woomer) and is inspired by Tsoding's [`boomer`](https://github.com/tsoding/boomer) for X11: take a snapshot of the screen, then zoom, pan and spotlight it.
 
 ## Features
 
-* **Fast Screen Capture:** Captures output directly via `grim` into memory without saving temporary files to disk.
+* **Instant capture.** The screenshot is taken with `grim` and piped straight into memory. No temporary files.
+* **Multi-monitor aware.** Monitor geometry comes from `swaymsg`. You can capture one output or the whole layout, and choose which monitor shows the result.
+* **Smooth zoom.** Scroll or keyboard zoom builds momentum and glides to a stop. Every step is a constant percentage, so it feels the same at any zoom level.
+* **Smooth flashlight.** Resizing the spotlight eases continuously to the new size, and the edge is anti-aliased.
+* **Inertial panning.** Drag with the left mouse button and let go to fling the view.
+* **Flashlight burst and mirror mode.** Quick ways to point at something or flip the view horizontally.
+* **No JSON library.** A tiny built-in scanner reads the few fields needed from `swaymsg`.
 
-* **Dynamic Monitor Detection:** Scans monitor geometry using `swaymsg`.
+## Requirements
 
-* **Smooth Inertial Zoom:** Natural, responsive camera movement and zoom scaling.
+* A C compiler (`gcc` or `clang`) and `make`
+* **raylib** 4.0 or newer
+* **grim**, for screenshots
+* **sway**, which provides `swaymsg`, for monitor geometry
 
-* **Custom Shader Effects:** Built-in GLSL shaders for spotlight mask, dimming, and custom color overlays.
+Not supported: GNOME and KDE. They do not provide `swaymsg` and their compositors do not implement the screencopy protocol that `grim` uses.
 
-* **Flashlight Burst & Mirroring:** Interactive shortcuts for highlighting areas on screen.
-
-* **Zero Heavy JSON Dependencies:** Includes a custom lightweight inline JSON scanner for minimal overhead.
-
-## Prerequisites
-
-Before building `woomer`, ensure you have the following dependencies installed on your system:
-
-* **C Compiler** (`gcc` or `clang`)
-
-* **Make** / **Bash**
-
-* **raylib** (v4.0+)
-
-* **grim** (for screenshotting on Wayland)
-
-* **swaymsg** or compatible Wayland IPC utility
-
-### Installing Dependencies
-
-#### Arch / Artix Linux
+### Arch / Artix Linux
 
 ```
 sudo pacman -S gcc make raylib grim sway
 ```
 
-## Building and Installing
-
-Clone the repository and compile using either `make` or the build script:
+## Build and Install
 
 ```
-# Clone the repository
 git clone https://github.com/mushfiqurrahman1729/woomer-c.git
 cd woomer-c
 
-# Build using Makefile
+# Either
 make
 
-# Or build using build.sh
+# or
 chmod +x build.sh
 ./build.sh
 ```
 
-This will generate the `woomer` binary in your current directory.
+This produces the `woomer` binary in the current directory.
+
+The flashlight shader is loaded from the first of these that exists:
+
+1. `shaders/spotlight.fs` (relative to where you run it)
+2. `/usr/share/woomer/shaders/spotlight.fs`
+3. `/usr/local/share/woomer/shaders/spotlight.fs`
+
+If none is found, an identical copy compiled into the binary is used, so `woomer` still works on its own.
 
 ## Usage
 
-Run `woomer` directly from your terminal or bind it to a hotkey in your window manager:
+Run it from a terminal, or bind it to a key in your Sway config:
 
 ```
-./woomer
+./woomer [OPTIONS]
+```
 
 ```
+bindsym $mod+z exec woomer
+```
+
+### Options
+
+| Option | Description |
+| ----- | ----- |
+| `--monitor <name>` | Output that the window is shown on. Defaults to the first output. |
+| `--output <name>` | Output to capture. Captures all outputs if not given. |
+| `--radius <number>` | Starting flashlight size. Must be greater than 0. Defaults to `1`. |
+| `-S`, `--show-cursor` | Include the mouse cursor in the screenshot. |
+
+Output names are the ones `swaymsg -t get_outputs` shows, such as `DP-1` or `eDP-1`.
 
 ### Controls
 
-| Action | Control | 
- | ----- | ----- | 
-| **Zoom In / Out** | Mouse Wheel / Scroll | 
-| **Adjust Spotlight Size** | `Shift` + Mouse Wheel | 
-| **Pan Camera** | Move Mouse | 
-| **Toggle Mirror Mode** | Keypress / Mouse Click | 
-| **Flashlight**  | f | 
-| **Exit** | `Escape` / `Q` | 
+| Action | Mouse | Keyboard |
+| ----- | ----- | ----- |
+| **Zoom in / out** (around the cursor) | Scroll wheel | `=` / `-` |
+| **Flashlight bigger / smaller** (flashlight must be on) | `Shift` + scroll wheel | `+` / `_` |
+| **Pan** | Hold left button and drag, release to fling | |
+| **Toggle flashlight** | | `F` |
+| **Flashlight burst** | | `Ctrl` |
+| **Mirror** | | `M` |
+| **Reset view** | | `0` |
+| **Quit** | Right click | `Esc`, `Q` or `A` |
+
+Notes:
+
+* Tap `=` or `-` for one step, hold for continuous zoom. `+` and `_` work the same way for the flashlight.
+* `+` and `_` are `Shift` + `=` and `Shift` + `-` on a US-style layout.
+* The `Ctrl` burst jumps the flashlight to three times its current size, then eases back.
+* `0` resets zoom, position and mirror. It does not change the flashlight size.
 
 ## Configuration
 
-You can customize `woomer` by modifying variables at the top of `main.c` or editing the embedded GLSL shader logic before compiling.
+The feel of zoom and the flashlight is set by `#define`s at the top of `main.c`:
+
+| Setting | Effect |
+| ----- | ----- |
+| `ZOOM_DECAY` | How quickly zoom momentum fades. |
+| `ZOOM_LOG_GAIN` | How far one scroll tick or key press zooms. |
+| `ZOOM_KEY_RATE` | Zoom speed while `=` or `-` is held. |
+| `RADIUS_MIN`, `RADIUS_MAX` | Smallest and largest flashlight size. |
+| `RADIUS_TICK_LOG` | Size change per scroll tick or key press. |
+| `RADIUS_KEY_RATE` | Resize speed while `+` or `_` is held. |
+| `RADIUS_SMOOTH` | How quickly the flashlight reaches its new size. Higher is snappier. |
+| `BURST_DECAY` | How quickly the `Ctrl` burst fades. |
+
+The dimming colour is `SPOTLIGHT_TINT`, and the base flashlight size is `UNIT_RADIUS` in the shader. Rebuild after changing either.
 
 ## License
 
-This project is open-source and available under the GNU Public license.
+Released under the GNU General Public License.
