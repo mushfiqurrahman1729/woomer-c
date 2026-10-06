@@ -28,12 +28,11 @@ void main()
 
     // Calculate spotlight radius in pixels
     float spotlightRadius = float(UNIT_RADIUS) * spotlightRadiusMultiplier;
-    if (distanceToCursor > spotlightRadius)
-    {
-        finalColor = (mix(texelColor, vec4(spotlightTint.rgb, 1.0), spotlightTint.a) * colDiffuse);
-    }
-    else
-    {
-        finalColor = (texelColor * colDiffuse);
-    }
+
+    // 0 inside the circle, 1 outside, with a ~1.5px anti-aliased edge so the
+    // rim doesn't shimmer while the radius is animating
+    float outside = smoothstep(spotlightRadius - 0.75, spotlightRadius + 0.75, distanceToCursor);
+
+    vec4 dimmed = mix(texelColor, vec4(spotlightTint.rgb, 1.0), spotlightTint.a);
+    finalColor = mix(texelColor, dimmed, outside) * colDiffuse;
 }
